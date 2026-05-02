@@ -1,24 +1,30 @@
 /**
  * useRecorder — loop-aware recording state machine for the recorder plugin.
  *
- * State transitions (see /Users/stevehiehn/.claude/plans/i-need-a-new-dreamy-phoenix.md
- * for the canonical diagram):
+ * State transitions:
  *
  *   idle ──Record──► arming ──onDeckBoundary──► recording (loop 0)
  *                       │
  *                       ├──onDeckBoundary──► markRecordingChunkBoundary
  *                       │                     ↓ engine emits chunkFinalized
- *                       │                     onChunkFinalized → caller creates+populates+mutes track
+ *                       │                     hook BUFFERS the chunk
  *                       │                     ↓
  *                       │                  recording (loop N+1)
  *                       │
  *                       └──Stop──► stopping ──stopTrackRecording──►
- *                                  onChunkFinalized (final) → caller creates final track
+ *                                  final chunk added to buffer
+ *                                  → onSessionFinalized(chunks[]) fires once
  *                                  → idle
  *
- * The hook calls host methods but does NOT touch tracks itself — it
- * surfaces `onChunkFinalized` so the caller (RecorderPanel) decides what
- * to do with each finalized WAV (create track, mute, name, FX preset, etc).
+ * Key design (Phase 8.1): the hook does NOT touch tracks per-chunk during
+ * recording. It buffers `RecordingChunkFinalizedEvent` payloads in memory
+ * and emits a single `onSessionFinalized(chunks)` callback on stop. The
+ * caller (RecorderPanel) processes the full list in a tight batch — this
+ * keeps the audio thread free from Tracktion track-creation pressure
+ * during the live capture window.
+ *
+ * The 1:1 mapping (one chunk → one Tracktion track) is preserved; only
+ * the *timing* of track creation moves to stop.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -33,32 +39,45 @@ export interface UseRecorderResult {
   state: RecorderState;
   /** Last error message, when state==='error'. Cleared when leaving error. */
   error: string | null;
-  /** Number of chunks finalized since the current session started. */
+  /** Number of chunks captured so far in the current session. */
   chunksFinalized: number;
-  /** Begin a session. Arms first; engine waits for the next deck boundary. */
+  /**
+   * Begin a session. Arms first; engine waits for the next deck boundary.
+   *
+   * Note: `deviceId` becomes optional once the SDK widens
+   * `host.startTrackRecording` to accept undefined (Phase 8.4); until
+   * then the caller must supply the platform-resolved input device id.
+   */
   start: (deviceId: string) => Promise<void>;
-  /** End the current session. Final chunk is finalized via stopRecording. */
+  /** End the current session. All chunks are delivered via onSessionFinalized. */
   stop: () => Promise<void>;
   /**
    * Cancel the current arming/recording state without finalizing the
-   * pending take. Used when scenes change mid-session.
+   * pending session. No `onSessionFinalized` fires; buffered chunks are
+   * dropped. Used when scenes change mid-session.
    */
   cancel: () => Promise<void>;
 }
 
 export interface UseRecorderOptions {
-  /** Called when each chunk is finalized (per loop boundary + once on stop). */
-  onChunkFinalized: (event: RecordingChunkFinalizedEvent) => void;
+  /**
+   * Called once when a session ends cleanly via `stop()` with the full
+   * ordered list of finalized chunks (boundary chunks + the final chunk
+   * from the stop call). The caller is responsible for batch-creating
+   * Tracktion tracks from these chunks.
+   */
+  onSessionFinalized: (chunks: RecordingChunkFinalizedEvent[]) => void | Promise<void>;
 }
 
 /**
  * Drives the recorder state machine against a PluginHost. Subscribes to
  * `host.onDeckBoundary` while recording so each loop boundary issues
- * `host.markRecordingChunkBoundary`.
+ * `host.markRecordingChunkBoundary`. Buffers `chunkFinalized` events in
+ * memory; flushes them via `onSessionFinalized` on stop.
  */
 export function useRecorder(
   host: PluginHost,
-  { onChunkFinalized }: UseRecorderOptions
+  { onSessionFinalized }: UseRecorderOptions
 ): UseRecorderResult {
   const [state, setState] = useState<RecorderState>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -69,8 +88,13 @@ export function useRecorder(
   const stateRef = useRef<RecorderState>('idle');
   stateRef.current = state;
 
-  const onChunkFinalizedRef = useRef(onChunkFinalized);
-  onChunkFinalizedRef.current = onChunkFinalized;
+  const onSessionFinalizedRef = useRef(onSessionFinalized);
+  onSessionFinalizedRef.current = onSessionFinalized;
+
+  // Buffered chunks for the active session. Reset on start; flushed on
+  // stop. Held in a ref so the engine event callback can append to it
+  // without triggering re-renders for every chunk.
+  const chunksBufferRef = useRef<RecordingChunkFinalizedEvent[]>([]);
 
   // Keep boundary listener subscribed only while we're actively recording.
   const boundaryUnsubRef = useRef<(() => void) | null>(null);
@@ -79,12 +103,12 @@ export function useRecorder(
   // Plugin host auto-cleans these on plugin deactivation.
   useEffect(() => {
     const unsub = host.onRecordingChunkFinalized((event) => {
-      setChunksFinalized((n) => n + 1);
-      try {
-        onChunkFinalizedRef.current(event);
-      } catch (err) {
-        console.error('[useRecorder] onChunkFinalized handler threw:', err);
-      }
+      // Accept events only while a session is active. A late event from
+      // a previous session (e.g. cancel-then-quick-restart) gets dropped.
+      const s = stateRef.current;
+      if (s === 'idle' || s === 'error') return;
+      chunksBufferRef.current.push(event);
+      setChunksFinalized(chunksBufferRef.current.length);
     });
     return unsub;
   }, [host]);
@@ -92,10 +116,6 @@ export function useRecorder(
   const subscribeBoundaryListener = useCallback(() => {
     if (boundaryUnsubRef.current) return;  // Already subscribed.
     boundaryUnsubRef.current = host.onDeckBoundary(() => {
-      // Fire boundary marker only while actively recording. The arming
-      // state's boundary is the trigger for transitioning to recording —
-      // the engine's first chunk auto-opens at start so we don't need to
-      // mark anything on the very first boundary.
       if (stateRef.current === 'recording') {
         host.markRecordingChunkBoundary().catch((err) => {
           console.error('[useRecorder] markRecordingChunkBoundary failed:', err);
@@ -124,6 +144,7 @@ export function useRecorder(
       }
       setError(null);
       setChunksFinalized(0);
+      chunksBufferRef.current = [];
       setState('arming');
       try {
         await host.startTrackRecording(deviceId);
@@ -146,8 +167,25 @@ export function useRecorder(
     unsubscribeBoundaryListener();
     try {
       await host.stopTrackRecording();
-      // Final chunk fires onChunkFinalized via the host's event channel.
-      // Wait one microtask for that to dispatch before flipping to idle.
+
+      // The final chunk arrives via the host's event channel. The engine
+      // emits the broadcast on the IPC thread synchronously from the
+      // stopRecording RPC handler (see IPCServer.cpp), but the renderer
+      // sees it as an async event — wait briefly so the buffer captures
+      // it before we flush.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      // Snapshot + flush. Reset buffer BEFORE invoking the callback so
+      // any errors in the caller don't leak into the next session.
+      const snapshot = chunksBufferRef.current.slice();
+      chunksBufferRef.current = [];
+
+      try {
+        await onSessionFinalizedRef.current(snapshot);
+      } catch (cbErr) {
+        console.error('[useRecorder] onSessionFinalized handler threw:', cbErr);
+      }
+
       setState('idle');
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -166,6 +204,10 @@ export function useRecorder(
     } catch {
       // Best-effort cleanup; ignore errors on cancel.
     }
+    // Drop buffered chunks — cancel intentionally does NOT fire
+    // onSessionFinalized.
+    chunksBufferRef.current = [];
+    setChunksFinalized(0);
     setState('idle');
     setError(null);
   }, [host, unsubscribeBoundaryListener]);

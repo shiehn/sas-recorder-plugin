@@ -1,11 +1,18 @@
 /**
- * useRecorder state-machine tests
+ * useRecorder state-machine tests (Phase 8.1 — batch model)
  *
  * Drives the hook through every state transition with a mocked
  * PluginHost: idle → arming → recording (×N loops) → stopping → idle,
- * plus the error and cancel paths. Verifies that the engine boundary
- * RPC is called at exactly the right moments (NOT on the arming-to-
- * recording transition; only on subsequent boundaries).
+ * plus the error and cancel paths.
+ *
+ * Key Phase 8.1 invariants verified:
+ *   1. The engine boundary RPC (`markRecordingChunkBoundary`) is called
+ *      on every loop boundary AFTER the arming → recording transition,
+ *      but NOT on the very first boundary (chunk 0 was opened at start).
+ *   2. `onSessionFinalized` fires EXACTLY ONCE per stop, with the full
+ *      ordered chunk list. No per-chunk callback fires during recording.
+ *   3. `cancel` does NOT fire `onSessionFinalized` — buffered chunks
+ *      are dropped on cancel.
  */
 
 import { renderHook, act, waitFor } from '@testing-library/react';
@@ -90,11 +97,11 @@ function fireChunkFinalized(state: MockHostState, chunkIndex: number): void {
   }
 }
 
-describe('useRecorder', () => {
+describe('useRecorder (Phase 8.1 batch model)', () => {
   it('starts in the idle state with no error and zero chunks', () => {
     const { host } = createMockHost();
     const { result } = renderHook(() =>
-      useRecorder(host, { onChunkFinalized: jest.fn() })
+      useRecorder(host, { onSessionFinalized: jest.fn() })
     );
 
     expect(result.current.state).toBe('idle');
@@ -105,7 +112,7 @@ describe('useRecorder', () => {
   it('transitions idle → arming → recording when start succeeds and a deck boundary fires', async () => {
     const { host, state } = createMockHost();
     const { result } = renderHook(() =>
-      useRecorder(host, { onChunkFinalized: jest.fn() })
+      useRecorder(host, { onSessionFinalized: jest.fn() })
     );
 
     await act(async () => {
@@ -119,17 +126,14 @@ describe('useRecorder', () => {
       fireBoundary(state, 0);
     });
     expect(result.current.state).toBe('recording');
-
-    // The very first boundary must NOT mark a chunk — chunk 0 is
-    // already open from startTrackRecording. Marking would split off
-    // an empty chunk and create a useless take-001.wav at start.
+    // First boundary must NOT mark a chunk — chunk 0 already open.
     expect(state.markBoundaryCallCount).toBe(0);
   });
 
   it('marks a boundary on each subsequent boundary while recording', async () => {
     const { host, state } = createMockHost();
     const { result } = renderHook(() =>
-      useRecorder(host, { onChunkFinalized: jest.fn() })
+      useRecorder(host, { onSessionFinalized: jest.fn() })
     );
 
     await act(async () => {
@@ -139,7 +143,6 @@ describe('useRecorder', () => {
       fireBoundary(state, 0);
     });
 
-    // Three more boundaries → 3 markBoundary calls (chunks 1, 2, 3).
     act(() => {
       fireBoundary(state, 1);
     });
@@ -153,13 +156,45 @@ describe('useRecorder', () => {
     expect(state.markBoundaryCallCount).toBe(3);
   });
 
-  it('forwards each chunk-finalized event to the caller and increments chunksFinalized', async () => {
+  it('buffers chunks during recording — onSessionFinalized does NOT fire per chunk', async () => {
     const { host, state } = createMockHost();
-    const onChunk = jest.fn();
-    const { result } = renderHook(() => useRecorder(host, { onChunkFinalized: onChunk }));
+    const onSession = jest.fn();
+    const { result } = renderHook(() => useRecorder(host, { onSessionFinalized: onSession }));
 
     await act(async () => {
       await result.current.start('mic-1');
+    });
+    act(() => {
+      fireBoundary(state, 0);
+    });
+
+    // Three chunks finalize while recording — none of these should
+    // trigger onSessionFinalized.
+    act(() => {
+      fireChunkFinalized(state, 0);
+    });
+    act(() => {
+      fireChunkFinalized(state, 1);
+    });
+    act(() => {
+      fireChunkFinalized(state, 2);
+    });
+
+    expect(onSession).not.toHaveBeenCalled();
+    // chunksFinalized counter still updates so the panel can show progress.
+    expect(result.current.chunksFinalized).toBe(3);
+  });
+
+  it('flushes the entire chunk buffer to onSessionFinalized exactly once on stop', async () => {
+    const { host, state } = createMockHost();
+    const onSession = jest.fn();
+    const { result } = renderHook(() => useRecorder(host, { onSessionFinalized: onSession }));
+
+    await act(async () => {
+      await result.current.start('mic-1');
+    });
+    act(() => {
+      fireBoundary(state, 0);
     });
 
     act(() => {
@@ -172,10 +207,23 @@ describe('useRecorder', () => {
       fireChunkFinalized(state, 2);
     });
 
-    expect(onChunk).toHaveBeenCalledTimes(3);
-    expect(onChunk.mock.calls[0][0].chunkIndex).toBe(0);
-    expect(onChunk.mock.calls[2][0].chunkIndex).toBe(2);
-    expect(result.current.chunksFinalized).toBe(3);
+    // Stop. The hook waits ~50ms for the final chunk to land via the
+    // engine event channel; simulate that arriving during the wait.
+    await act(async () => {
+      const stopPromise = result.current.stop();
+      // Final chunk fires while stop() is awaiting the dispatch window.
+      fireChunkFinalized(state, 3);
+      await stopPromise;
+    });
+
+    expect(onSession).toHaveBeenCalledTimes(1);
+    const flushedChunks = onSession.mock.calls[0][0] as RecordingChunkFinalizedEvent[];
+    expect(flushedChunks).toHaveLength(4);
+    expect(flushedChunks.map((c) => c.chunkIndex)).toEqual([0, 1, 2, 3]);
+
+    await waitFor(() => {
+      expect(result.current.state).toBe('idle');
+    });
   });
 
   it('transitions to error state when startTrackRecording rejects', async () => {
@@ -184,7 +232,7 @@ describe('useRecorder', () => {
     state.startError = 'Permission denied';
 
     const { result } = renderHook(() =>
-      useRecorder(host, { onChunkFinalized: jest.fn() })
+      useRecorder(host, { onSessionFinalized: jest.fn() })
     );
 
     await act(async () => {
@@ -195,11 +243,10 @@ describe('useRecorder', () => {
     expect(result.current.error).toBe('Permission denied');
   });
 
-  it('stop transitions stopping → idle and calls stopTrackRecording', async () => {
+  it('cancel drops buffered chunks and does NOT fire onSessionFinalized', async () => {
     const { host, state } = createMockHost();
-    const { result } = renderHook(() =>
-      useRecorder(host, { onChunkFinalized: jest.fn() })
-    );
+    const onSession = jest.fn();
+    const { result } = renderHook(() => useRecorder(host, { onSessionFinalized: onSession }));
 
     await act(async () => {
       await result.current.start('mic-1');
@@ -207,45 +254,27 @@ describe('useRecorder', () => {
     act(() => {
       fireBoundary(state, 0);
     });
-    expect(result.current.state).toBe('recording');
-
-    await act(async () => {
-      await result.current.stop();
-    });
-
-    expect(state.stopCallCount).toBe(1);
-    await waitFor(() => {
-      expect(result.current.state).toBe('idle');
-    });
-  });
-
-  it('cancel cleans up without surfacing an error even when stop throws', async () => {
-    const { host, state } = createMockHost();
-    (host.stopTrackRecording as jest.Mock).mockRejectedValueOnce(new Error('engine offline'));
-
-    const { result } = renderHook(() =>
-      useRecorder(host, { onChunkFinalized: jest.fn() })
-    );
-
-    await act(async () => {
-      await result.current.start('mic-1');
+    act(() => {
+      fireChunkFinalized(state, 0);
     });
     act(() => {
-      fireBoundary(state, 0);
+      fireChunkFinalized(state, 1);
     });
 
     await act(async () => {
       await result.current.cancel();
     });
 
+    expect(onSession).not.toHaveBeenCalled();
     expect(result.current.state).toBe('idle');
     expect(result.current.error).toBeNull();
+    expect(result.current.chunksFinalized).toBe(0);
   });
 
-  it('start during stopping/recording is a no-op (does not call startTrackRecording twice)', async () => {
+  it('start during arming/recording is a no-op (does not call startTrackRecording twice)', async () => {
     const { host, state } = createMockHost();
     const { result } = renderHook(() =>
-      useRecorder(host, { onChunkFinalized: jest.fn() })
+      useRecorder(host, { onSessionFinalized: jest.fn() })
     );
 
     await act(async () => {
@@ -253,10 +282,45 @@ describe('useRecorder', () => {
     });
     expect(state.startCallCount).toBe(1);
 
-    // Second start while in arming state — should be ignored.
+    // Second start while still in arming state — should be ignored.
     await act(async () => {
       await result.current.start('mic-1');
     });
     expect(state.startCallCount).toBe(1);
+  });
+
+  it('chunk events arriving after a session ends are ignored (no leak into next session)', async () => {
+    const { host, state } = createMockHost();
+    const onSession = jest.fn();
+    const { result } = renderHook(() => useRecorder(host, { onSessionFinalized: onSession }));
+
+    // Session 1: start, capture, stop.
+    await act(async () => {
+      await result.current.start('mic-1');
+    });
+    act(() => {
+      fireBoundary(state, 0);
+    });
+    act(() => {
+      fireChunkFinalized(state, 0);
+    });
+    await act(async () => {
+      await result.current.stop();
+    });
+
+    // Late chunk event (shouldn't happen in practice, but defensive).
+    onSession.mockClear();
+    act(() => {
+      fireChunkFinalized(state, 99);
+    });
+
+    // Late event should NOT trigger another callback or affect the next session.
+    expect(onSession).not.toHaveBeenCalled();
+
+    // Session 2: start fresh — chunksFinalized starts at 0.
+    await act(async () => {
+      await result.current.start('mic-1');
+    });
+    expect(result.current.chunksFinalized).toBe(0);
   });
 });

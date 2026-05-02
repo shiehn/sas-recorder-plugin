@@ -1,13 +1,15 @@
 /**
  * RecorderPanel — top-level UI for the Recorder plugin.
  *
- * Wires `useRecorder` to a Record/Stop button, an input device picker,
- * and a list of take rows. Each finalized chunk creates a NEW audio
- * track via `host.createTrack`, places the WAV via `host.writeAudioClip`,
- * and immediately mutes it (`host.setTrackMute(id, true)`) so subsequent
- * loops don't bleed.
- *
- * Take rows use the refactored AudioTrackInput in displayMode='take'.
+ * Phase 8 surface:
+ *   - Input device + latency live on the platform (Audio Routing panel).
+ *     This panel just shows a hint when no input is configured.
+ *   - Per-chunk track creation moved to STOP — the panel buffers
+ *     RecordingChunkFinalizedEvents during recording (via useRecorder)
+ *     and batch-creates Tracktion tracks once the user clicks Stop.
+ *     Avoids audio-thread pressure during the live capture window.
+ *   - 1:1 mapping preserved: each chunk → one audio track in the scene.
+ *     Users delete takes manually via the ✕ on each row.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -26,10 +28,6 @@ import {
   applyVocalPresetToTracks,
   type VocalPresetId,
 } from './vocalPresets';
-import {
-  probeOutputInputLatency,
-  getStoredLatencyOffsetSamples,
-} from './alignmentCalibration';
 
 interface Take {
   /** Tracktion engine track id (PluginTrackHandle.id). */
@@ -44,9 +42,7 @@ interface Take {
   chunkIndex: number;
 }
 
-/**
- * Take counter — engineers expect take numbers to start at 1, not 0.
- */
+/** Take counter — engineers expect take numbers to start at 1, not 0. */
 function buildTakeLabel(takeNumber: number, chunkIndex: number): string {
   return `Take ${takeNumber} · chunk ${chunkIndex + 1}`;
 }
@@ -57,20 +53,13 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
   isAuthenticated,
   isConnected,
 }) => {
-  const [devices, setDevices] = useState<AudioInputDevice[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [targetInfo, setTargetInfo] = useState<RecordingTargetInfo | null>(null);
+  const [platformInput, setPlatformInput] = useState<AudioInputDevice | null>(null);
   const [takes, setTakes] = useState<Take[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [vocalPresetId, setVocalPresetId] = useState<VocalPresetId>('none');
   const vocalPresetIdRef = useRef<VocalPresetId>('none');
   vocalPresetIdRef.current = vocalPresetId;
-  const [latencyOffsetSamples, setLatencyOffsetSamples] = useState<number>(() =>
-    getStoredLatencyOffsetSamples(host)
-  );
-  const latencyOffsetRef = useRef<number>(latencyOffsetSamples);
-  latencyOffsetRef.current = latencyOffsetSamples;
-  const [calibrating, setCalibrating] = useState(false);
 
   // Refresh target info when scene changes; gates Record button.
   useEffect(() => {
@@ -88,104 +77,100 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
     };
   }, [host, activeSceneId]);
 
-  // Enumerate input devices once on mount + every time the panel re-mounts.
+  // Read the platform-configured input device on mount + whenever the
+  // panel re-mounts. (The Audio Routing panel is where users actually
+  // change this; we just display it here.)
   useEffect(() => {
     let cancelled = false;
     host
-      .getAudioInputDevices()
-      .then((list) => {
-        if (cancelled) return;
-        setDevices(list);
-        // Pre-select the system default if no manual choice has been made.
-        const def = list.find((d) => d.isDefault) ?? list[0];
-        if (def && !selectedDeviceId) {
-          setSelectedDeviceId(def.deviceId);
-        }
+      .getCurrentInputDevice()
+      .then((device) => {
+        if (!cancelled) setPlatformInput(device);
       })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err));
-        }
+      .catch(() => {
+        // Fall through with null — UI shows "configure input" hint.
       });
     return () => {
       cancelled = true;
     };
-    // selectedDeviceId intentionally NOT in deps — we only seed on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [host]);
 
-  const handleChunkFinalized = useCallback(
-    async (event: RecordingChunkFinalizedEvent): Promise<void> => {
+  /**
+   * Batch-create Tracktion tracks from the chunks captured during the
+   * recording session. Called once when `useRecorder.stop()` resolves —
+   * NOT per-chunk. This keeps Tracktion mutation off the audio thread
+   * during the live capture window; instead, all N tracks appear in one
+   * tight loop after the user clicks Stop.
+   */
+  const handleSessionFinalized = useCallback(
+    async (chunks: RecordingChunkFinalizedEvent[]): Promise<void> => {
+      if (chunks.length === 0) return;
+
+      // Read the platform's calibrated latency offset ONCE at the start
+      // of the batch — applied to every new track so they line up with
+      // the source loop.
+      let offset = 0;
       try {
-        const label = buildTakeLabel(takes.length + 1, event.chunkIndex);
-        const handle: PluginTrackHandle = await host.createTrack({ name: label });
-        await host.writeAudioClip(handle.id, event.filePath);
-        await host.setTrackMute(handle.id, true);
+        offset = await host.getRecordingLatencyOffsetSamples();
+      } catch (err) {
+        console.warn('[RecorderPanel] getRecordingLatencyOffsetSamples failed:', err);
+      }
 
-        // Read the LATEST offset / preset via refs so we don't have to
-        // re-subscribe the chunk listener every time these change.
-        const offset = latencyOffsetRef.current;
-        const presetId = vocalPresetIdRef.current;
+      const presetId = vocalPresetIdRef.current;
+      const preset = VOCAL_PRESETS.find((p) => p.id === presetId);
 
-        // Apply the calibrated latency offset so the take aligns with
-        // the source loop. Best-effort: a missing offset is benign.
-        if (offset > 0) {
-          try {
-            await host.setAudioOffsetSamples(handle.id, offset);
-          } catch (offsetErr) {
-            console.warn('[RecorderPanel] setAudioOffsetSamples failed:', offsetErr);
+      const baseTakeNumber = takes.length;
+      const newTakes: Take[] = [];
+
+      for (let i = 0; i < chunks.length; i++) {
+        const event = chunks[i];
+        const label = buildTakeLabel(baseTakeNumber + i + 1, event.chunkIndex);
+        try {
+          const handle: PluginTrackHandle = await host.createTrack({ name: label });
+          await host.writeAudioClip(handle.id, event.filePath);
+          await host.setTrackMute(handle.id, true);
+
+          if (offset > 0) {
+            try {
+              await host.setAudioOffsetSamples(handle.id, offset);
+            } catch (offsetErr) {
+              console.warn('[RecorderPanel] setAudioOffsetSamples failed:', offsetErr);
+            }
           }
-        }
 
-        // Apply the currently-selected vocal preset to the new take so
-        // unmuting it produces the intended sound. Best-effort: errors
-        // here are non-fatal — the take still lands.
-        const preset = VOCAL_PRESETS.find((p) => p.id === presetId);
-        if (preset && preset.id !== 'none') {
-          try {
-            await applyVocalPreset(host, handle.id, preset);
-          } catch (presetErr) {
-            console.warn('[RecorderPanel] applyVocalPreset failed for new take:', presetErr);
+          if (preset && preset.id !== 'none') {
+            try {
+              await applyVocalPreset(host, handle.id, preset);
+            } catch (presetErr) {
+              console.warn('[RecorderPanel] applyVocalPreset failed for new take:', presetErr);
+            }
           }
-        }
 
-        const newTake: Take = {
-          trackId: handle.id,
-          dbId: handle.dbId,
-          label,
-          filePath: event.filePath,
-          chunkIndex: event.chunkIndex,
-        };
-        setTakes((prev) => [...prev, newTake]);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('[RecorderPanel] Failed to attach take:', msg);
-        setError(msg);
+          newTakes.push({
+            trackId: handle.id,
+            dbId: handle.dbId,
+            label,
+            filePath: event.filePath,
+            chunkIndex: event.chunkIndex,
+          });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(
+            `[RecorderPanel] Failed to attach take for chunk ${event.chunkIndex}:`,
+            msg
+          );
+          setError(msg);
+        }
+      }
+
+      if (newTakes.length > 0) {
+        setTakes((prev) => [...prev, ...newTakes]);
       }
     },
     [host, takes.length]
   );
 
-  const recorder = useRecorder(host, { onChunkFinalized: handleChunkFinalized });
-
-  const handleCalibrate = useCallback(async (): Promise<void> => {
-    if (calibrating) return;
-    if (!selectedDeviceId) {
-      setError('Select an input device before calibrating');
-      return;
-    }
-    setCalibrating(true);
-    setError(null);
-    try {
-      const result = await probeOutputInputLatency(host, selectedDeviceId);
-      setLatencyOffsetSamples(result.offsetSamples);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(`Calibration failed: ${msg}`);
-    } finally {
-      setCalibrating(false);
-    }
-  }, [host, selectedDeviceId, calibrating]);
+  const recorder = useRecorder(host, { onSessionFinalized: handleSessionFinalized });
 
   /**
    * Switch the vocal preset and reapply to every existing take so the
@@ -210,8 +195,9 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
     [host, takes]
   );
 
-  // If we lose the active scene mid-record, finalize the in-progress take
-  // (it lands on the original scene via the host's grace track behavior).
+  // If we lose the active scene mid-record, finalize the in-progress
+  // session via cancel (drops buffered chunks rather than landing them
+  // on a stale scene).
   useEffect(() => {
     if (!activeSceneId && (recorder.state === 'arming' || recorder.state === 'recording')) {
       recorder.cancel().catch(() => {
@@ -235,17 +221,17 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
 
   const noScene = targetInfo?.sceneId == null;
   const renderLocked = targetInfo?.isRenderLocked === true;
-  const noDevice = devices.length === 0;
+  const noPlatformInput = platformInput == null;
   const blockedReason = !isAuthenticated
     ? 'Sign in to use the recorder'
     : !isConnected
       ? 'Audio engine not connected'
-      : noScene
-        ? 'Select a scene to record into'
-        : renderLocked
-          ? 'Render in progress — please wait'
-          : noDevice
-            ? 'No microphone detected'
+      : noPlatformInput
+        ? 'Configure an input device in Audio Routing'
+        : noScene
+          ? 'Select a scene to record into'
+          : renderLocked
+            ? 'Render in progress — please wait'
             : null;
 
   const canRecord =
@@ -254,15 +240,20 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
 
   return (
     <div className="flex flex-col gap-2 p-3" data-testid="recorder-panel">
-      {/* Status */}
+      {/* Status + Record/Stop */}
       <div className="flex items-center justify-between">
         <div className="text-xs text-sas-muted" data-testid="recorder-status">
-          {blockedReason ?? `${recorder.state}${isRecording ? ' · ' + recorder.chunksFinalized + ' takes' : ''}`}
+          {blockedReason ??
+            (isRecording
+              ? `Recording — ${recorder.chunksFinalized} take${recorder.chunksFinalized === 1 ? '' : 's'} captured`
+              : recorder.state === 'stopping'
+                ? 'Finalizing takes…'
+                : 'Ready to record')}
         </div>
         {canRecord && (
           <button
             data-testid="recorder-record-button"
-            onClick={() => recorder.start(selectedDeviceId)}
+            onClick={() => recorder.start('')}
             className="px-2 py-0.5 text-xs font-semibold rounded border bg-red-600/20 border-red-600 text-red-400 hover:bg-red-600 hover:text-white"
           >
             ● Record
@@ -279,26 +270,10 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
         )}
       </div>
 
-      {/* Input device picker */}
-      {!noDevice && (
-        <div className="flex items-center gap-2">
-          <label className="text-[10px] text-sas-muted/60" htmlFor="recorder-device-select">
-            Input:
-          </label>
-          <select
-            id="recorder-device-select"
-            data-testid="recorder-device-select"
-            value={selectedDeviceId}
-            onChange={(e) => setSelectedDeviceId(e.target.value)}
-            disabled={isRecording}
-            className="sas-input flex-1 text-xs px-2 py-0.5"
-          >
-            {devices.map((d) => (
-              <option key={d.deviceId} value={d.deviceId}>
-                {d.label} {d.isDefault ? '(default)' : ''}
-              </option>
-            ))}
-          </select>
+      {/* Platform input device readout (read-only — configured in Audio Routing) */}
+      {!noPlatformInput && (
+        <div className="text-[10px] text-sas-muted/60" data-testid="recorder-input-readout">
+          Input: {platformInput.label}
         </div>
       )}
 
@@ -321,24 +296,6 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
           ))}
         </select>
       </div>
-
-      {/* Latency calibration */}
-      {!noDevice && (
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] text-sas-muted/60">
-            Latency: {latencyOffsetSamples > 0 ? `${latencyOffsetSamples} samples` : 'uncalibrated'}
-          </span>
-          <button
-            data-testid="recorder-calibrate-button"
-            onClick={() => handleCalibrate()}
-            disabled={calibrating || isRecording || !selectedDeviceId}
-            className="ml-auto px-2 py-0.5 text-[10px] rounded border border-sas-border bg-sas-panel-alt text-sas-muted hover:border-sas-accent hover:text-sas-accent disabled:opacity-50 disabled:cursor-not-allowed"
-            title="Probe round-trip mic latency and store the offset for future takes"
-          >
-            {calibrating ? 'Calibrating…' : 'Calibrate'}
-          </button>
-        </div>
-      )}
 
       {/* Take list */}
       {takes.length > 0 && (
