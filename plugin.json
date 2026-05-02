@@ -1,0 +1,14 @@
+{
+  "id": "@signalsandsorcery/recorder",
+  "displayName": "Recorder",
+  "version": "1.0.0",
+  "description": "Loop-aware microphone recording — each loop creates a muted take",
+  "generatorType": "audio",
+  "main": "index.js",
+  "author": "Signals & Sorcery",
+  "minHostVersion": "2.1.0",
+  "builtIn": true,
+  "capabilities": {
+    "audioCapture": true
+  }
+}
