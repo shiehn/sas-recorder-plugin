@@ -2,7 +2,7 @@
  * Pure-function tests for the shared waveform module.
  *
  * `drawWaveform` needs a real canvas + window.devicePixelRatio so it's
- * exercised via the integration of WaveformView in the audio-texture +
+ * exercised via the integration of WaveformView in the stems +
  * recorder plugins. `computePeaks` is pure math and easy to test in
  * isolation.
  */

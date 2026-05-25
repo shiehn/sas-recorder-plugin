@@ -1,7 +1,7 @@
 /**
  * Shared waveform peaks + canvas drawer.
  *
- * Originally inlined in `audio-texture/TrimEditorDrawer.tsx`; lifted to
+ * Originally inlined in `stems/TrimEditorDrawer.tsx`; lifted to
  * this module so the recorder plugin's per-take rows can render the
  * same compact min/max display without duplicating the math.
  *
