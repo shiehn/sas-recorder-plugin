@@ -9,7 +9,7 @@ import {
   VOCAL_PRESETS,
   applyVocalPreset,
   applyVocalPresetToTracks,
-} from '../src/vocalPresets';
+} from '../vocalPresets';
 
 interface MockHostState {
   /** Map of category → final enabled state. */

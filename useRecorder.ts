@@ -115,11 +115,20 @@ export function useRecorder(
 
   const subscribeBoundaryListener = useCallback(() => {
     if (boundaryUnsubRef.current) return;  // Already subscribed.
-    boundaryUnsubRef.current = host.onDeckBoundary(() => {
+    boundaryUnsubRef.current = host.onDeckBoundary((event) => {
       if (stateRef.current === 'recording') {
-        host.markRecordingChunkBoundary().catch((err) => {
-          console.error('[useRecorder] markRecordingChunkBoundary failed:', err);
-        });
+        // Forward the audio-thread-captured host-time so the engine
+        // can split the chunk at the EXACT recorder-sample (Path 2 /
+        // sample-perfect take alignment). When the engine couldn't
+        // capture an anchor (probe unavailable, or this is a
+        // legacy-event path), boundaryHostTimeNs is undefined and we
+        // fall back to the legacy "split wherever the writer is"
+        // behavior — chunks still arrive but with ~5–50 ms of jitter.
+        host
+          .markRecordingChunkBoundary(event.boundaryHostTimeNs)
+          .catch((err) => {
+            console.error('[useRecorder] markRecordingChunkBoundary failed:', err);
+          });
       } else if (stateRef.current === 'arming') {
         // First boundary after arming → flip to recording. The engine's
         // chunk 0 already started at the call to startTrackRecording;

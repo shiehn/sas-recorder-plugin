@@ -21,6 +21,10 @@ import type {
   PluginSettingsSchema,
 } from '@signalsandsorcery/plugin-sdk';
 import { RecorderPanel } from './RecorderPanel';
+import recorderManifest from './plugin.json';
+
+/** Plugin manifest (re-exported so the host registers it from the package root). */
+export { recorderManifest };
 
 export class RecorderPlugin implements GeneratorPlugin {
   readonly id = '@signalsandsorcery/recorder';

@@ -21,7 +21,7 @@ import type {
   RecordingChunkFinalizedEvent,
   DeckBoundaryEvent,
 } from '@signalsandsorcery/plugin-sdk';
-import { useRecorder } from '../src/useRecorder';
+import { useRecorder } from '../useRecorder';
 
 interface MockHostState {
   startCallCount: number;
@@ -29,6 +29,8 @@ interface MockHostState {
   startError: string | null;
   stopCallCount: number;
   markBoundaryCallCount: number;
+  /** Host-time values forwarded to markRecordingChunkBoundary, in order. */
+  markBoundaryHostTimes: Array<number | undefined>;
   boundaryListeners: Array<(event: DeckBoundaryEvent) => void>;
   chunkListeners: Array<(event: RecordingChunkFinalizedEvent) => void>;
 }
@@ -40,6 +42,7 @@ function createMockHost(): { host: PluginHost; state: MockHostState } {
     startError: null,
     stopCallCount: 0,
     markBoundaryCallCount: 0,
+    markBoundaryHostTimes: [],
     boundaryListeners: [],
     chunkListeners: [],
   };
@@ -55,8 +58,9 @@ function createMockHost(): { host: PluginHost; state: MockHostState } {
       state.stopCallCount++;
       return { finalChunkPath: '/tmp/take-final.wav', durationMs: 1000 };
     }),
-    markRecordingChunkBoundary: jest.fn(async () => {
+    markRecordingChunkBoundary: jest.fn(async (boundaryHostTimeNs?: number) => {
       state.markBoundaryCallCount++;
+      state.markBoundaryHostTimes.push(boundaryHostTimeNs);
     }),
     onDeckBoundary: jest.fn((listener: (event: DeckBoundaryEvent) => void) => {
       state.boundaryListeners.push(listener);
@@ -77,8 +81,18 @@ function createMockHost(): { host: PluginHost; state: MockHostState } {
   return { host, state };
 }
 
-function fireBoundary(state: MockHostState, loopCount: number): void {
-  const event: DeckBoundaryEvent = { deckId: 'loop-a', bar: 0, beat: 0, loopCount };
+function fireBoundary(
+  state: MockHostState,
+  loopCount: number,
+  boundaryHostTimeNs?: number,
+): void {
+  const event: DeckBoundaryEvent = {
+    deckId: 'loop-a',
+    bar: 0,
+    beat: 0,
+    loopCount,
+    boundaryHostTimeNs,
+  };
   for (const listener of state.boundaryListeners) {
     listener(event);
   }
@@ -322,5 +336,74 @@ describe('useRecorder (Phase 8.1 batch model)', () => {
       await result.current.start('mic-1');
     });
     expect(result.current.chunksFinalized).toBe(0);
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Path 2 / sample-perfect-recording: boundaryHostTimeNs plumbing.
+  //
+  // The hook must forward the audio-thread-captured host-time from
+  // the DeckBoundaryEvent into markRecordingChunkBoundary verbatim,
+  // so the engine can split chunks at the EXACT recorder-sample
+  // (not "wherever the writer is"). Round-tripping through seconds
+  // or coercing to undefined would defeat the whole pipeline.
+  // ────────────────────────────────────────────────────────────────────
+
+  it('forwards boundaryHostTimeNs verbatim into markRecordingChunkBoundary', async () => {
+    const { host, state } = createMockHost();
+    const { result } = renderHook(() =>
+      useRecorder(host, { onSessionFinalized: jest.fn() })
+    );
+
+    await act(async () => {
+      await result.current.start('mic-1');
+    });
+    // First boundary just transitions arming → recording.
+    act(() => {
+      fireBoundary(state, 0, 1_000_000_000);
+    });
+    expect(state.markBoundaryCallCount).toBe(0);
+
+    // Subsequent boundaries each carry a distinct host-time. The
+    // recorder must call markRecordingChunkBoundary with that exact
+    // value as its first argument.
+    act(() => {
+      fireBoundary(state, 1, 2_000_000_000);
+    });
+    act(() => {
+      fireBoundary(state, 2, 3_500_000_001);
+    });
+    act(() => {
+      fireBoundary(state, 3, 5_750_123_456);
+    });
+
+    expect(state.markBoundaryCallCount).toBe(3);
+    expect(state.markBoundaryHostTimes).toEqual([
+      2_000_000_000,
+      3_500_000_001,
+      5_750_123_456,
+    ]);
+  });
+
+  it('forwards undefined when boundaryHostTimeNs is absent (legacy path)', async () => {
+    const { host, state } = createMockHost();
+    const { result } = renderHook(() =>
+      useRecorder(host, { onSessionFinalized: jest.fn() })
+    );
+
+    await act(async () => {
+      await result.current.start('mic-1');
+    });
+    act(() => {
+      fireBoundary(state, 0);  // no host-time
+    });
+    act(() => {
+      fireBoundary(state, 1);  // no host-time
+    });
+    act(() => {
+      fireBoundary(state, 2);  // no host-time
+    });
+
+    expect(state.markBoundaryCallCount).toBe(2);
+    expect(state.markBoundaryHostTimes).toEqual([undefined, undefined]);
   });
 });
