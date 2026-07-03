@@ -1007,6 +1007,7 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
               onPanChange={(pan) => handleTakePanChange(take.trackId, pan)}
               onDelete={() => handleDeleteTake(take.trackId)}
               onFxToggle={(cat, enabled) => handleTakeFxToggle(take.trackId, cat, enabled)}
+              externalFxHost={host}
               onFxPresetChange={(cat, idx) => handleTakeFxPresetChange(take.trackId, cat, idx)}
               onFxDryWetChange={(cat, val) => handleTakeFxDryWetChange(take.trackId, cat, val)}
               onToggleFxDrawer={() => toggleTakeFxDrawer(take.trackId)}
