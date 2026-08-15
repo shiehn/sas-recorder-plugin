@@ -19,12 +19,8 @@ import type {
   RecordingTargetInfo,
   RecordingChunkFinalizedEvent,
   PluginTrackHandle,
-  PluginTrackFxDetailState,
-  PluginFxCategoryDetailState,
-  FxCategory,
-  TrackFxDetailState,
 } from '@signalsandsorcery/plugin-sdk';
-import { TrackRow, EMPTY_FX_DETAIL_STATE } from '@signalsandsorcery/plugin-sdk';
+import { TrackRow } from '@signalsandsorcery/plugin-sdk';
 import { useRecorder } from './useRecorder';
 // Waveform / audio-clip UI toolkit — promoted to the SDK (W9), reached through
 // the host contract instead of a relative app path.
@@ -37,12 +33,6 @@ import {
   OffsetScrubber,
   synthesizeCuePoints,
 } from '@signalsandsorcery/plugin-sdk';
-import {
-  VOCAL_PRESETS,
-  applyVocalPreset,
-  applyVocalPresetToTracks,
-  type VocalPresetId,
-} from './vocalPresets';
 
 interface Take {
   /** Tracktion engine track id (PluginTrackHandle.id). */
@@ -61,12 +51,9 @@ interface Take {
    *  host.onTrackStateChange. Initial: muted=true so takes don't blast
    *  out of the cue mix immediately after recording. */
   runtimeState: { muted: boolean; solo: boolean; volume: number; pan: number };
-  /** Per-take FX detail (EQ / comp / chorus / phaser / delay / reverb)
-   *  in the SDK's FxToggleBar shape. Refreshed from
-   *  host.getTrackFxState whenever the FX drawer opens. */
-  fxDetailState: TrackFxDetailState;
-  /** Whether the FX drawer is open for this take's row. */
-  fxDrawerOpen: boolean;
+  /** Whether the track drawer is open for this take's row (FX tab —
+   *  third-party external FX via the SDK's TrackExternalFxSection). */
+  drawerOpen: boolean;
   /** Current sample offset on the audio clip — what the OffsetScrubber
    *  edits. Initialized to the value that handleSessionFinalized
    *  applied (latency compensation + sample-perfect alignment); user
@@ -89,9 +76,6 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
   const [platformInput, setPlatformInput] = useState<AudioInputDevice | null>(null);
   const [takes, setTakes] = useState<Take[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [vocalPresetId, setVocalPresetId] = useState<VocalPresetId>('none');
-  const vocalPresetIdRef = useRef<VocalPresetId>('none');
-  vocalPresetIdRef.current = vocalPresetId;
 
   // Phase 8.10 — live input level polled at ~30Hz so the recorder
   // panel itself can show a meter + scrolling waveform without forcing
@@ -288,9 +272,6 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
 
       const samplePerfect = baseRecorderSampleStart !== null && loopLengthSamples !== null;
 
-      const presetId = vocalPresetIdRef.current;
-      const preset = VOCAL_PRESETS.find((p) => p.id === presetId);
-
       const baseTakeNumber = takes.length;
       const newTakes: Take[] = [];
 
@@ -336,14 +317,6 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
             }
           }
 
-          if (preset && preset.id !== 'none') {
-            try {
-              await applyVocalPreset(host, handle.id, preset);
-            } catch (presetErr) {
-              console.warn('[RecorderPanel] applyVocalPreset failed for new take:', presetErr);
-            }
-          }
-
           newTakes.push({
             trackId: handle.id,
             dbId: handle.dbId,
@@ -351,8 +324,7 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
             filePath: event.filePath,
             chunkIndex: event.chunkIndex,
             runtimeState: { muted: true, solo: false, volume: 1, pan: 0 },
-            fxDetailState: { ...EMPTY_FX_DETAIL_STATE },
-            fxDrawerOpen: false,
+            drawerOpen: false,
             offsetSamples: takeOffset,
           });
         } catch (err: unknown) {
@@ -392,29 +364,6 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
   );
 
   const recorder = useRecorder(host, { onSessionFinalized: handleSessionFinalized });
-
-  /**
-   * Switch the vocal preset and reapply to every existing take so the
-   * panel's preset selector reads as a "global" knob, not just a
-   * forward-looking default.
-   */
-  const handleVocalPresetChange = useCallback(
-    async (id: VocalPresetId): Promise<void> => {
-      setVocalPresetId(id);
-      const preset = VOCAL_PRESETS.find((p) => p.id === id);
-      if (!preset) return;
-      const trackIds = takes.map((t) => t.trackId);
-      if (trackIds.length === 0) return;
-      const result = await applyVocalPresetToTracks(host, trackIds, preset);
-      if (result.failed.length > 0) {
-        console.warn(
-          `[RecorderPanel] vocal preset '${id}' failed on ${result.failed.length} of ${trackIds.length} takes`,
-          result.failed
-        );
-      }
-    },
-    [host, takes]
-  );
 
   // If we lose the active scene mid-record, drop the in-progress
   // session via cancel rather than landing chunks on a stale scene.
@@ -490,9 +439,9 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
    * silences within an IPC round-trip, then finalizes the recording
    * session in parallel. Awaiting recorder.stop first would block the
    * deck stop behind the take-finalization batch (per chunk:
-   * createTrack + writeAudioClip + setTrackMute + setAudioOffsetSamples
-   * + applyVocalPreset, plus a debounced LoopWorkstation reload that
-   * walks every track in the scene), which felt like a UI freeze.
+   * createTrack + writeAudioClip + setTrackMute + setAudioOffsetSamples,
+   * plus a debounced LoopWorkstation reload that walks every track in
+   * the scene), which felt like a UI freeze.
    *
    * The cross-direction listener (deck stop → recorder stop) still
    * covers the other half of the symmetric rule — e.g. when the user
@@ -660,106 +609,6 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
     [host, updateTakeRuntime]
   );
 
-  // ─── Per-take FX (mirrors the loops plugin's wiring) ───────────────────
-  // Optimistic update with rollback on failure. The drawer toggle also
-  // refreshes from engine on open, so any state drift from a remote
-  // mutation (CLI, API) reconciles on next open.
-  const handleTakeFxToggle = useCallback(
-    (trackId: string, category: FxCategory, enabled: boolean): void => {
-      setTakes((prev) =>
-        prev.map((t) =>
-          t.trackId === trackId
-            ? {
-                ...t,
-                fxDetailState: {
-                  ...t.fxDetailState,
-                  [category]: { ...t.fxDetailState[category], enabled },
-                },
-              }
-            : t
-        )
-      );
-      host.toggleTrackFx(trackId, category, enabled).catch(() => {
-        setTakes((prev) =>
-          prev.map((t) =>
-            t.trackId === trackId
-              ? {
-                  ...t,
-                  fxDetailState: {
-                    ...t.fxDetailState,
-                    [category]: { ...t.fxDetailState[category], enabled: !enabled },
-                  },
-                }
-              : t
-          )
-        );
-      });
-    },
-    [host]
-  );
-
-  const handleTakeFxPresetChange = useCallback(
-    (trackId: string, category: FxCategory, presetIndex: number): void => {
-      setTakes((prev) =>
-        prev.map((t) =>
-          t.trackId === trackId
-            ? {
-                ...t,
-                fxDetailState: {
-                  ...t.fxDetailState,
-                  [category]: { ...t.fxDetailState[category], presetIndex },
-                },
-              }
-            : t
-        )
-      );
-      host
-        .setTrackFxPreset(trackId, category, presetIndex)
-        .then((result) => {
-          if (result.dryWet !== undefined) {
-            setTakes((prev) =>
-              prev.map((t) =>
-                t.trackId === trackId
-                  ? {
-                      ...t,
-                      fxDetailState: {
-                        ...t.fxDetailState,
-                        [category]: {
-                          ...t.fxDetailState[category],
-                          dryWet: result.dryWet as number,
-                        },
-                      },
-                    }
-                  : t
-              )
-            );
-          }
-        })
-        .catch(() => {});
-    },
-    [host]
-  );
-
-  const handleTakeFxDryWetChange = useCallback(
-    (trackId: string, category: FxCategory, value: number): void => {
-      setTakes((prev) =>
-        prev.map((t) =>
-          t.trackId === trackId
-            ? {
-                ...t,
-                fxDetailState: {
-                  ...t.fxDetailState,
-                  [category]: { ...t.fxDetailState[category], dryWet: value },
-                },
-              }
-            : t
-        )
-      );
-      host.setTrackFxDryWet(trackId, category, value).catch(() => {});
-    },
-    [host]
-  );
-
   // OffsetScrubber commit — write the new sample offset to the engine
   // and mirror it in panel state so subsequent renders reflect the
   // committed value.
@@ -777,27 +626,15 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
     [host]
   );
 
-  const toggleTakeFxDrawer = useCallback(
-    (trackId: string): void => {
-      const opening = !takes.find((t) => t.trackId === trackId)?.fxDrawerOpen;
-      setTakes((prev) =>
-        prev.map((t) => (t.trackId === trackId ? { ...t, fxDrawerOpen: !t.fxDrawerOpen } : t))
-      );
-      if (opening) {
-        host
-          .getTrackFxState(trackId)
-          .then((fxState: PluginTrackFxDetailState) => {
-            setTakes((prev) =>
-              prev.map((t) =>
-                t.trackId === trackId ? { ...t, fxDetailState: pluginFxToToggleFx(fxState) } : t
-              )
-            );
-          })
-          .catch(() => {});
-      }
-    },
-    [host, takes]
-  );
+  // FX button on a take row — open/close the SDK track drawer (FX tab).
+  // The drawer's third-party FX section (TrackExternalFxSection) reads
+  // its own state through `externalFxHost`, so there is nothing to
+  // refresh panel-side.
+  const toggleTakeFxDrawer = useCallback((trackId: string): void => {
+    setTakes((prev) =>
+      prev.map((t) => (t.trackId === trackId ? { ...t, drawerOpen: !t.drawerOpen } : t))
+    );
+  }, []);
 
   // Scene loop length in engine samples — used so each take row's
   // waveform spans a full loop width (partial last chunks render with
@@ -965,26 +802,6 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
         </div>
       )}
 
-      {/* Vocal preset chooser */}
-      <div className="flex items-center gap-2">
-        <label className="text-[10px] text-sas-muted/60" htmlFor="recorder-vocal-preset">
-          Vocal preset:
-        </label>
-        <select
-          id="recorder-vocal-preset"
-          data-testid="recorder-vocal-preset"
-          value={vocalPresetId}
-          onChange={(e) => handleVocalPresetChange(e.target.value as VocalPresetId)}
-          className="sas-input flex-1 text-xs px-2 py-0.5"
-        >
-          {VOCAL_PRESETS.map((p) => (
-            <option key={p.id} value={p.id} title={p.description}>
-              {p.label}
-            </option>
-          ))}
-        </select>
-      </div>
-
       {/* Take list — uses SDK TrackRow so takes look and behave like
           AI audio tracks: M/S/volume/pan/delete. Each take is a real
           Tracktion track (created at session-finalize), so the same
@@ -998,18 +815,15 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
               key={take.trackId}
               track={{ id: take.trackId, name: take.label }}
               runtimeState={take.runtimeState}
-              fxDetailState={take.fxDetailState}
-              fxDrawerOpen={take.fxDrawerOpen}
+              drawerOpen={take.drawerOpen}
+              drawerTab="fx"
               accentColor="#FF6B6B"
               onMuteToggle={() => handleTakeMuteToggle(take.trackId)}
               onSoloToggle={() => handleTakeSoloToggle(take.trackId)}
               onVolumeChange={(vol) => handleTakeVolumeChange(take.trackId, vol)}
               onPanChange={(pan) => handleTakePanChange(take.trackId, pan)}
               onDelete={() => handleDeleteTake(take.trackId)}
-              onFxToggle={(cat, enabled) => handleTakeFxToggle(take.trackId, cat, enabled)}
               externalFxHost={host}
-              onFxPresetChange={(cat, idx) => handleTakeFxPresetChange(take.trackId, cat, idx)}
-              onFxDryWetChange={(cat, val) => handleTakeFxDryWetChange(take.trackId, cat, val)}
               onToggleFxDrawer={() => toggleTakeFxDrawer(take.trackId)}
               contentSlot={
                 <div
@@ -1083,24 +897,3 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
 };
 
 export default RecorderPanel;
-
-/**
- * Convert SDK's PluginTrackFxDetailState (per-category typed) into the
- * FxToggleBar's TrackFxDetailState shape (Record<FxCategory, ...>).
- * Mirrors the helper in LoopsPanel — kept inline so the recorder
- * has no cross-plugin import.
- */
-function pluginFxToToggleFx(sdkState: PluginTrackFxDetailState): TrackFxDetailState {
-  const result = { ...EMPTY_FX_DETAIL_STATE };
-  for (const category of ['eq', 'compressor', 'chorus', 'phaser', 'delay', 'reverb'] as const) {
-    const sdkCat = sdkState[category] as PluginFxCategoryDetailState | undefined;
-    if (sdkCat) {
-      result[category] = {
-        enabled: sdkCat.enabled,
-        presetIndex: sdkCat.presetIndex,
-        dryWet: sdkCat.dryWet,
-      };
-    }
-  }
-  return result;
-}

@@ -11,7 +11,7 @@ A [Signals & Sorcery](https://signalsandsorcery.com) plugin for loop-aware micro
 ## What it does
 
 - **Loop-aware tracking** — each iteration of the active loop finalizes into its own muted audio track, so layered vocal takes never bleed into the next pass
-- **Vocal presets** — three baked FX chains (Bright, Dark, Spoken-Word) applied automatically to each take
+- **Per-take third-party FX** — each take row opens the standard track drawer for VST3/AU insert effects
 - **One-shot mic-latency calibration** — click-and-listen probe stores a recording offset so takes line up with the grid
 - **Per-take waveform + delete** — every take renders an inline waveform and can be removed without touching the rest of the layer stack
 - **Live input meter + auto-set gain** — peak indicator and a one-click probe that sets recording gain to land peaks at -6 dBFS
@@ -40,7 +40,7 @@ Built against `@signalsandsorcery/plugin-sdk` ≥ 2.1.0. SDK 2.1.0 added the `au
 ┌──────────────────────────────────────────────────────────────┐
 │  RecorderPanel                                               │
 │  ─ Record/Stop button + input device picker                  │
-│  ─ Vocal preset chooser + Calibrate button                   │
+│  ─ Live input meter + Calibrate button                       │
 │  ─ List of takes; each take shows a waveform + delete        │
 └──────────────────────────────────────────────────────────────┘
                        │
@@ -58,7 +58,7 @@ Built against `@signalsandsorcery/plugin-sdk` ≥ 2.1.0. SDK 2.1.0 added the `au
               loop iteration finalizes a chunk.
 
               onRecordingChunkFinalized → host.createTrack +
-              writeAudioClip + setTrackMute(true) + applyVocalPreset.
+              writeAudioClip + setTrackMute(true) + setAudioOffsetSamples.
 ```
 
 ## Development
