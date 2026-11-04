@@ -22,6 +22,7 @@ import type {
 } from '@signalsandsorcery/plugin-sdk';
 import { TrackRow } from '@signalsandsorcery/plugin-sdk';
 import { useRecorder } from './useRecorder';
+import { computeTakeOffsets, loopLengthEngineSamples } from './takePlacement';
 // Waveform / audio-clip UI toolkit — promoted to the SDK (W9), reached through
 // the host contract instead of a relative app path.
 import {
@@ -230,47 +231,10 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
         console.warn('[RecorderPanel] getRecordingLatencyOffsetSamples failed:', err);
       }
 
-      // Sample-perfect take alignment (Path 2). Every chunk in a
-      // recording session shares a recorder-sample origin (sample 0 ==
-      // first sample of the recording). `chunk.recorderSampleStart` is
-      // "samples since recording started" for each take.
-      //
-      // For each take, the offset on the timeline (in engine samples,
-      // relative to the loop start) is:
-      //
-      //   inLoopOffset = (chunk.recorderSampleStart - firstChunk.recorderSampleStart)
-      //                  mod loopLengthSamples
-      //   takeOffset   = inLoopOffset - latencyOffset
-      //
-      // The mod-loopLength step folds takes recorded across N loop
-      // iterations down to the same in-loop offset, so take N and take
-      // N+1 (recorded one full loop apart) both land at the same
-      // sample within the loop.
-      //
-      // When the engine couldn't supply per-chunk sample positions
-      // (recorderSampleStart === undefined or -1), or we don't know
-      // the loop length, we fall back to a static -latencyOffset for
-      // every take.
-      const firstChunk = chunks[0];
-      const baseRecorderSampleStart =
-        typeof firstChunk.recorderSampleStart === 'number' && firstChunk.recorderSampleStart >= 0
-          ? firstChunk.recorderSampleStart
-          : null;
-
-      // Loop length in samples — derived from the engine's reported
-      // sample rate, BPM, bars, and 4/4 assumption. Null when we
-      // don't have enough musical context (no scene, missing bars).
-      const loopLengthSamples = (() => {
-        if (!targetInfo || targetInfo.bars == null) return null;
-        const sr = targetInfo.engineSampleRate > 0 ? targetInfo.engineSampleRate : 48000;
-        const bpm = targetInfo.bpm > 0 ? targetInfo.bpm : 120;
-        const beatsPerBar = 4;  // 4/4 assumption baked into RecordingTargetInfo
-        const totalBeats = targetInfo.bars * beatsPerBar;
-        const seconds = (totalBeats * 60) / bpm;
-        return Math.round(seconds * sr);
-      })();
-
-      const samplePerfect = baseRecorderSampleStart !== null && loopLengthSamples !== null;
+      // Per-take placement (S-473): sample-perfect when the engine
+      // supplied the chunk's frames and a host-time boundary, else the
+      // latency alone. Pure math in takePlacement.ts (tested there).
+      const takeOffsets = computeTakeOffsets(chunks, latencyOffset, targetInfo);
 
       const baseTakeNumber = takes.length;
       const newTakes: Take[] = [];
@@ -283,31 +247,9 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
           await host.writeAudioClip(handle.id, event.filePath);
           await host.setTrackMute(handle.id, true);
 
-          // Per-take offset: sample-perfect when the engine supplied
-          // recorderSampleStart and we know the loop length; else
-          // fall back to a static latency offset for every take.
-          let takeOffset: number;
-          if (samplePerfect && typeof event.recorderSampleStart === 'number'
-              && event.recorderSampleStart >= 0
-              && baseRecorderSampleStart !== null
-              && loopLengthSamples !== null) {
-            // (recorderSampleStart - baseRecorderSampleStart) is the
-            // delta from the first chunk's start, in recorder samples.
-            // mod loopLengthSamples folds multi-loop deltas back into
-            // the [0, loopLength) range. Latency offset compensates
-            // for round-trip device latency — vocal arrives at the
-            // mic L_rt samples LATE, so we shift the clip EARLIER by
-            // L_rt to put it back where the user heard it.
-            const sampleDelta = event.recorderSampleStart - baseRecorderSampleStart;
-            const inLoopOffset = ((sampleDelta % loopLengthSamples) + loopLengthSamples) % loopLengthSamples;
-            takeOffset = inLoopOffset - latencyOffset;
-            // Negative offsets are clamped to 0 inside the host's
-            // setAudioOffsetSamples — we still emit the signed value
-            // so the OffsetScrubber UI shows the calibrated trim.
-          } else {
-            // Legacy path: just apply the static latency offset.
-            takeOffset = latencyOffset;
-          }
+          // Signed: the host persists it as given (the OffsetScrubber
+          // shows the calibrated trim).
+          const takeOffset = takeOffsets[i];
 
           if (takeOffset !== 0) {
             try {
@@ -642,13 +584,7 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
   // back to undefined when there's no scene context, in which case
   // WaveformView fills naturally with the chunk's actual sample count.
   const loopLengthSamples: number | undefined = useMemo(() => {
-    if (!targetInfo || targetInfo.bars == null) return undefined;
-    const sr = targetInfo.engineSampleRate > 0 ? targetInfo.engineSampleRate : 48000;
-    const bpm = targetInfo.bpm > 0 ? targetInfo.bpm : 120;
-    const beatsPerBar = 4;
-    const totalBeats = targetInfo.bars * beatsPerBar;
-    const seconds = (totalBeats * 60) / bpm;
-    return Math.round(seconds * sr);
+    return loopLengthEngineSamples(targetInfo) ?? undefined;
   }, [targetInfo]);
 
   // Synthetic cue points for the OffsetScrubber. Recorder takes don't
